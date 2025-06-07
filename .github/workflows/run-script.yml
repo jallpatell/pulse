@@ -1,0 +1,33 @@
+name: Scrape Trading View
+on:
+  push:
+  schedule:
+    # Runs every day at 1:30 PM UTC, which is 7:00 PM IST
+    - cron: '30 13 * * *'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+    - name: Install dependencies
+      run: npm install
+    - name: Install Google Chrome Stable
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y google-chrome-stable
+    - name: Run scraper
+      timeout-minutes: 15
+      run: node index.js
+      env:
+        PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: true
+        PUPPETEER_EXECUTABLE_PATH: /usr/bin/google-chrome
+    - name: Upload results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: stock-data
+        path: debug_*.png
