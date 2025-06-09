@@ -1,6 +1,5 @@
 name: Scrape Trading View
 on:
-  push:
   schedule:
     # Runs every day at 1:30 PM UTC, which is 7:00 PM IST
     - cron: '30 13 * * *'
@@ -20,7 +19,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y google-chrome-stable
     - name: Run scraper
-      timeout-minutes: 15
+      timeout-minutes: 60
       run: node index.js
       env:
         PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: true
