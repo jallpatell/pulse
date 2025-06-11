@@ -19,7 +19,6 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y google-chrome-stable
     - name: Run scraper
-      timeout-minutes: 60
       run: node index.js
       env:
         PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: true
