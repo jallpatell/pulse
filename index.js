@@ -6,7 +6,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const CONFIG = {
-    groqApiKey: process.env.GROQ_API_KEY || 'your_groq_api_key',
+    groqApiKey: process.env.GROQ_API_KEY || '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',
     websiteUrl: 'https://pulse.zerodha.com',
     groqModel: 'deepseek-r1-distill-llama-70b',
     apiInterval: process.env.API_INTERVAL ? parseInt(process.env.API_INTERVAL) : 30000,
