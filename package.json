@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js"
   },
   "keywords": [],
   "author": "",
@@ -17,6 +20,10 @@
     "interval-promise": "^1.4.0",
     "jsdom": "^26.1.0",
     "puppeteer": "^24.10.0",
-    "set-interval-async": "github:ealmansi/set-interval-async"
+    "set-interval-async": "github:ealmansi/set-interval-async",
+    "typescript": "^5.8.3"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^21.1.7"
   }
 }

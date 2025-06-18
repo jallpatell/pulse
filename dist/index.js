@@ -1,25 +1,10 @@
-"use strict";
-var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
-    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
-    return new (P || (P = Promise))(function (resolve, reject) {
-        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
-        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
-        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
-        step((generator = generator.apply(thisArg, _arguments || [])).next());
-    });
-};
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-var _a;
-Object.defineProperty(exports, "__esModule", { value: true });
-const puppeteer_1 = __importDefault(require("puppeteer"));
-const axios_1 = __importDefault(require("axios"));
-const googleapis_1 = require("googleapis");
-const dotenv_1 = __importDefault(require("dotenv"));
-const jsdom_1 = require("jsdom");
-const promises_1 = require("timers/promises");
-dotenv_1.default.config();
+import puppeteer from 'puppeteer';
+import axios from 'axios';
+import { google } from 'googleapis';
+import dotenv from 'dotenv';
+import { JSDOM } from 'jsdom';
+import { setTimeout as sleep } from 'timers/promises';
+dotenv.config();
 // ========== Configuration ==========
 const CONFIG = {
     groqApiKey: process.env.GROQ_API_KEY || '',
@@ -37,7 +22,7 @@ const CONFIG = {
         sheetName: process.env.SHEET_NAME || 'Sheet1',
         serviceAccount: {
             email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-            privateKey: (_a = process.env.GOOGLE_PRIVATE_KEY) === null || _a === void 0 ? void 0 : _a.replace(/\\n/g, '\n')
+            privateKey: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n')
         }
     },
     groqRateLimit: {
@@ -62,6 +47,10 @@ if (!CONFIG.wpUser || !CONFIG.wpPass) {
 }
 // ========== EnhancedRateLimiter Class ==========
 class EnhancedRateLimiter {
+    maxRequests;
+    intervalMs;
+    requestTimestamps;
+    pausedUntil;
     getMaxRequests() {
         return this.maxRequests;
     }
@@ -71,47 +60,41 @@ class EnhancedRateLimiter {
         this.requestTimestamps = [];
         this.pausedUntil = 0;
     }
-    waitForAvailability() {
-        return __awaiter(this, void 0, void 0, function* () {
-            const now = Date.now();
-            if (now < this.pausedUntil) {
-                const waitTime = this.pausedUntil - now;
-                yield (0, promises_1.setTimeout)(waitTime);
-                return this.waitForAvailability();
-            }
-            this.requestTimestamps = this.requestTimestamps.filter(ts => now - ts < this.intervalMs);
-            if (this.requestTimestamps.length < this.maxRequests) {
-                return;
-            }
-            const oldestRequest = this.requestTimestamps[0];
-            const timeToWait = (this.intervalMs - (now - oldestRequest)) + 100;
-            yield (0, promises_1.setTimeout)(timeToWait);
+    async waitForAvailability() {
+        const now = Date.now();
+        if (now < this.pausedUntil) {
+            const waitTime = this.pausedUntil - now;
+            await sleep(waitTime);
             return this.waitForAvailability();
-        });
+        }
+        this.requestTimestamps = this.requestTimestamps.filter(ts => now - ts < this.intervalMs);
+        if (this.requestTimestamps.length < this.maxRequests) {
+            return;
+        }
+        const oldestRequest = this.requestTimestamps[0];
+        const timeToWait = (this.intervalMs - (now - oldestRequest)) + 100;
+        await sleep(timeToWait);
+        return this.waitForAvailability();
     }
-    executeRequest(requestFn) {
-        return __awaiter(this, void 0, void 0, function* () {
-            var _a;
-            yield this.waitForAvailability();
-            const now = Date.now();
-            this.requestTimestamps.push(now);
-            this.requestTimestamps = this.requestTimestamps.slice(-this.maxRequests);
-            try {
-                return yield requestFn();
-            }
-            catch (error) {
-                if (axios_1.default.isAxiosError(error) && ((_a = error.response) === null || _a === void 0 ? void 0 : _a.status) === 429) {
-                    const retryAfter = this.calculateRetryAfter(error);
-                    this.pausedUntil = now + retryAfter;
-                    throw error;
-                }
+    async executeRequest(requestFn) {
+        await this.waitForAvailability();
+        const now = Date.now();
+        this.requestTimestamps.push(now);
+        this.requestTimestamps = this.requestTimestamps.slice(-this.maxRequests);
+        try {
+            return await requestFn();
+        }
+        catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 429) {
+                const retryAfter = this.calculateRetryAfter(error);
+                this.pausedUntil = now + retryAfter;
                 throw error;
             }
-        });
+            throw error;
+        }
     }
     calculateRetryAfter(error) {
-        var _a, _b;
-        const retryAfterHeader = (_b = (_a = error.response) === null || _a === void 0 ? void 0 : _a.headers) === null || _b === void 0 ? void 0 : _b['retry-after'];
+        const retryAfterHeader = error.response?.headers?.['retry-after'];
         if (retryAfterHeader) {
             const seconds = parseInt(retryAfterHeader, 10);
             let calculatedDelay = seconds * 1000 * CONFIG.groqRateLimit.retryAfterMultiplier;
@@ -122,6 +105,12 @@ class EnhancedRateLimiter {
 }
 // ========== NewsProcessor Class ==========
 class NewsProcessor {
+    queue;
+    isProcessing;
+    validNSC;
+    consecutiveGroqErrors;
+    rateLimiter;
+    onQueueComplete;
     setOnQueueComplete(callback) {
         this.onQueueComplete = callback;
     }
@@ -132,77 +121,73 @@ class NewsProcessor {
         this.consecutiveGroqErrors = 0;
         this.rateLimiter = new EnhancedRateLimiter(CONFIG.groqRateLimit.maxRequests, CONFIG.groqRateLimit.intervalMs);
     }
-    initialize() {
-        return __awaiter(this, void 0, void 0, function* () {
-            yield this.loadSymbolsFromSheet();
-        });
+    async initialize() {
+        await this.loadSymbolsFromSheet();
     }
-    loadSymbolsFromSheet() {
-        return __awaiter(this, void 0, void 0, function* () {
-            let sheetLoadAttempts = 0;
-            while (sheetLoadAttempts < CONFIG.maxRetries) {
-                try {
-                    const auth = new googleapis_1.google.auth.JWT({
-                        email: CONFIG.googleSheet.serviceAccount.email,
-                        key: CONFIG.googleSheet.serviceAccount.privateKey,
-                        scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly']
-                    });
-                    yield auth.authorize();
-                    const sheets = googleapis_1.google.sheets({ version: 'v4', auth });
-                    const response = yield sheets.spreadsheets.values.get({
-                        spreadsheetId: CONFIG.googleSheet.sheetId,
-                        range: `${CONFIG.googleSheet.sheetName}!A:C`,
-                    });
-                    const rows = response.data.values;
-                    if (!rows || rows.length < 2) {
-                        throw new Error('No data found in sheet');
-                    }
-                    const headers = rows[0];
-                    const symbolCol = headers.findIndex(header => header.toLowerCase() === 'symbol');
-                    if (symbolCol === -1) {
-                        throw new Error('Symbol column not found');
-                    }
-                    const symbols = rows.slice(1)
-                        .map(row => { var _a; return (_a = row[symbolCol]) === null || _a === void 0 ? void 0 : _a.toString().toUpperCase().trim(); })
-                        .filter((s) => !!s);
-                    this.validNSC = new Set(symbols);
-                    return;
+    async loadSymbolsFromSheet() {
+        let sheetLoadAttempts = 0;
+        while (sheetLoadAttempts < CONFIG.maxRetries) {
+            try {
+                const auth = new google.auth.JWT({
+                    email: CONFIG.googleSheet.serviceAccount.email,
+                    key: CONFIG.googleSheet.serviceAccount.privateKey,
+                    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly']
+                });
+                await auth.authorize();
+                const sheets = google.sheets({ version: 'v4', auth });
+                const response = await sheets.spreadsheets.values.get({
+                    spreadsheetId: CONFIG.googleSheet.sheetId,
+                    range: `${CONFIG.googleSheet.sheetName}!A:C`,
+                });
+                const rows = response.data.values;
+                if (!rows || rows.length < 2) {
+                    throw new Error('No data found in sheet');
                 }
-                catch (err) {
-                    sheetLoadAttempts++;
-                    if (sheetLoadAttempts >= CONFIG.maxRetries) {
-                        throw err;
-                    }
-                    const delay = Math.min(CONFIG.maxBackoff, CONFIG.backoffBase * Math.pow(2, sheetLoadAttempts - 1));
-                    yield (0, promises_1.setTimeout)(delay);
+                const headers = rows[0];
+                const symbolCol = headers.findIndex(header => header.toLowerCase() === 'symbol');
+                if (symbolCol === -1) {
+                    throw new Error('Symbol column not found');
                 }
+                const symbols = rows.slice(1)
+                    .map(row => row[symbolCol]?.toString().toUpperCase().trim())
+                    .filter((s) => !!s);
+                this.validNSC = new Set(symbols);
+                return;
             }
-        });
+            catch (err) {
+                sheetLoadAttempts++;
+                if (sheetLoadAttempts >= CONFIG.maxRetries) {
+                    throw err;
+                }
+                const delay = Math.min(CONFIG.maxBackoff, CONFIG.backoffBase * Math.pow(2, sheetLoadAttempts - 1));
+                await sleep(delay);
+            }
+        }
     }
-    addToQueue(items) {
-        return __awaiter(this, void 0, void 0, function* () {
-            const itemArray = Array.isArray(items) ? items : [items];
-            const newItems = itemArray
-                .filter(item => item === null || item === void 0 ? void 0 : item.htmlContent)
-                .filter(item => !this.queue.some(existing => existing.htmlContent === item.htmlContent))
-                .map(item => (Object.assign(Object.assign({}, item), { htmlContent: this.preprocessHtml(item.htmlContent.substring(0, CONFIG.maxHtmlContentLength)) })));
-            if (newItems.length > 0) {
-                this.queue.push(...newItems);
-                if (!this.isProcessing) {
-                    this.processQueue().catch(console.error);
-                }
+    async addToQueue(items) {
+        const itemArray = Array.isArray(items) ? items : [items];
+        const newItems = itemArray
+            .filter(item => item?.htmlContent)
+            .filter(item => !this.queue.some(existing => existing.htmlContent === item.htmlContent))
+            .map(item => ({
+            ...item,
+            htmlContent: this.preprocessHtml(item.htmlContent.substring(0, CONFIG.maxHtmlContentLength))
+        }));
+        if (newItems.length > 0) {
+            this.queue.push(...newItems);
+            if (!this.isProcessing) {
+                this.processQueue().catch(console.error);
             }
-        });
+        }
     }
     preprocessHtml(html) {
-        var _a, _b, _c, _d, _e, _f, _g;
         try {
-            const dom = new jsdom_1.JSDOM(html);
+            const dom = new JSDOM(html);
             const doc = dom.window.document;
-            const title = ((_b = (_a = doc.querySelector('.title a')) === null || _a === void 0 ? void 0 : _a.textContent) === null || _b === void 0 ? void 0 : _b.trim()) || '';
-            const desc = ((_d = (_c = doc.querySelector('.desc')) === null || _c === void 0 ? void 0 : _c.textContent) === null || _d === void 0 ? void 0 : _d.trim()) || '';
-            const source = ((_f = (_e = doc.querySelector('.feed')) === null || _e === void 0 ? void 0 : _e.textContent) === null || _f === void 0 ? void 0 : _f.replace('—', '').trim()) || '';
-            const url = ((_g = doc.querySelector('.title a')) === null || _g === void 0 ? void 0 : _g.getAttribute('href')) || '';
+            const title = doc.querySelector('.title a')?.textContent?.trim() || '';
+            const desc = doc.querySelector('.desc')?.textContent?.trim() || '';
+            const source = doc.querySelector('.feed')?.textContent?.replace('—', '').trim() || '';
+            const url = doc.querySelector('.title a')?.getAttribute('href') || '';
             return `
                 <div class="item">
                     <div class="title"><a href="${url}">${title}</a></div>
@@ -215,60 +200,55 @@ class NewsProcessor {
             return html;
         }
     }
-    processQueue() {
-        return __awaiter(this, void 0, void 0, function* () {
-            if (this.isProcessing)
-                return;
-            this.isProcessing = true;
-            try {
-                while (this.queue.length > 0) {
-                    const item = this.queue.shift();
-                    if (!item)
-                        continue;
-                    try {
-                        yield this.processItem(item);
-                        yield (0, promises_1.setTimeout)(CONFIG.apiInterval / this.rateLimiter.getMaxRequests());
-                    }
-                    catch (err) {
-                        console.error('Error processing item:', err);
-                        if (this.queue.length < 500) {
-                            this.queue.push(item);
-                            yield (0, promises_1.setTimeout)(CONFIG.groqRequestDelay * 2);
-                        }
+    async processQueue() {
+        if (this.isProcessing)
+            return;
+        this.isProcessing = true;
+        try {
+            while (this.queue.length > 0) {
+                const item = this.queue.shift();
+                if (!item)
+                    continue;
+                try {
+                    await this.processItem(item);
+                    await sleep(CONFIG.apiInterval / this.rateLimiter.getMaxRequests());
+                }
+                catch (err) {
+                    console.error('Error processing item:', err);
+                    if (this.queue.length < 500) {
+                        this.queue.push(item);
+                        await sleep(CONFIG.groqRequestDelay * 2);
                     }
                 }
             }
-            finally {
-                this.isProcessing = false;
-                if (this.onQueueComplete && this.queue.length === 0) {
-                    this.onQueueComplete();
-                }
+        }
+        finally {
+            this.isProcessing = false;
+            if (this.onQueueComplete && this.queue.length === 0) {
+                this.onQueueComplete();
             }
-        });
+        }
     }
-    processItem(item) {
-        return __awaiter(this, void 0, void 0, function* () {
-            var _a, _b;
-            const aiResult = yield this.analyzeWithAI(item);
-            if (!aiResult)
-                return null;
-            const processedResult = {
-                company_name: this.cleanseText(aiResult.company_name || 'Unknown Company'),
-                headline: this.cleanseText(aiResult.Headline || 'No Title'),
-                description: this.cleanseText(aiResult.Body || ''),
-                nsc: aiResult.nsc ? aiResult.nsc.toUpperCase().trim() : null,
-                news_date: new Date().toISOString().split('T')[0],
-                source: this.cleanseText(((_a = aiResult.source) === null || _a === void 0 ? void 0 : _a.replace('—', '').trim()) || 'Unknown'),
-                url: ((_b = aiResult.url) === null || _b === void 0 ? void 0 : _b.trim()) || null
-            };
-            if (processedResult.nsc && this.validNSC.has(processedResult.nsc)) {
-                yield this.storeResult(processedResult);
-            }
-            else {
-                yield this.storeExtraResult(processedResult);
-            }
-            return processedResult;
-        });
+    async processItem(item) {
+        const aiResult = await this.analyzeWithAI(item);
+        if (!aiResult)
+            return null;
+        const processedResult = {
+            company_name: this.cleanseText(aiResult.company_name || 'Unknown Company'),
+            headline: this.cleanseText(aiResult.Headline || 'No Title'),
+            description: this.cleanseText(aiResult.Body || ''),
+            nsc: aiResult.nsc ? aiResult.nsc.toUpperCase().trim() : null,
+            news_date: new Date().toISOString().split('T')[0],
+            source: this.cleanseText(aiResult.source?.replace('—', '').trim() || 'Unknown'),
+            url: aiResult.url?.trim() || null
+        };
+        if (processedResult.nsc && this.validNSC.has(processedResult.nsc)) {
+            await this.storeResult(processedResult);
+        }
+        else {
+            await this.storeExtraResult(processedResult);
+        }
+        return processedResult;
     }
     cleanseText(text) {
         return typeof text !== 'string' ? '' : text
@@ -277,42 +257,40 @@ class NewsProcessor {
             .trim()
             .substring(0, 3000);
     }
-    analyzeWithAI(item) {
-        return __awaiter(this, void 0, void 0, function* () {
-            const companyList = Array.from(this.validNSC).join(',');
-            const prompt = this.createPrompt(item.htmlContent, companyList);
-            for (let attempt = 1; attempt <= CONFIG.maxRetries; attempt++) {
-                try {
-                    const response = yield this.rateLimiter.executeRequest(() => axios_1.default.post('https://api.groq.com/openai/v1/chat/completions', {
-                        model: CONFIG.groqModel,
-                        messages: [{ role: "user", content: prompt }],
-                        temperature: 0.2,
-                        response_format: { type: "json_object" },
-                        max_tokens: 1000
-                    }, {
-                        headers: {
-                            'Authorization': `Bearer ${CONFIG.groqApiKey}`,
-                            'Content-Type': 'application/json'
-                        },
-                        timeout: 30000
-                    }));
+    async analyzeWithAI(item) {
+        const companyList = Array.from(this.validNSC).join(',');
+        const prompt = this.createPrompt(item.htmlContent, companyList);
+        for (let attempt = 1; attempt <= CONFIG.maxRetries; attempt++) {
+            try {
+                const response = await this.rateLimiter.executeRequest(() => axios.post('https://api.groq.com/openai/v1/chat/completions', {
+                    model: CONFIG.groqModel,
+                    messages: [{ role: "user", content: prompt }],
+                    temperature: 0.2,
+                    response_format: { type: "json_object" },
+                    max_tokens: 1000
+                }, {
+                    headers: {
+                        'Authorization': `Bearer ${CONFIG.groqApiKey}`,
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: 30000
+                }));
+                this.consecutiveGroqErrors = 0;
+                return this.parseAIResponse(response);
+            }
+            catch (err) {
+                this.consecutiveGroqErrors++;
+                if (this.consecutiveGroqErrors >= CONFIG.maxConsecutiveErrors) {
+                    await sleep(300000);
                     this.consecutiveGroqErrors = 0;
-                    return this.parseAIResponse(response);
                 }
-                catch (err) {
-                    this.consecutiveGroqErrors++;
-                    if (this.consecutiveGroqErrors >= CONFIG.maxConsecutiveErrors) {
-                        yield (0, promises_1.setTimeout)(300000);
-                        this.consecutiveGroqErrors = 0;
-                    }
-                    if (attempt < CONFIG.maxRetries) {
-                        const delay = Math.min(CONFIG.maxBackoff, CONFIG.backoffBase * Math.pow(2, attempt - 1));
-                        yield (0, promises_1.setTimeout)(delay);
-                    }
+                if (attempt < CONFIG.maxRetries) {
+                    const delay = Math.min(CONFIG.maxBackoff, CONFIG.backoffBase * Math.pow(2, attempt - 1));
+                    await sleep(delay);
                 }
             }
-            return null;
-        });
+        }
+        return null;
     }
     createPrompt(htmlContent, companyList) {
         const maxCompanyListLength = 400;
@@ -329,9 +307,8 @@ class NewsProcessor {
 HTML: ${htmlContent}`;
     }
     parseAIResponse(response) {
-        var _a, _b;
         try {
-            const content = (_b = (_a = response.data.choices[0]) === null || _a === void 0 ? void 0 : _a.message) === null || _b === void 0 ? void 0 : _b.content;
+            const content = response.data.choices[0]?.message?.content;
             if (!content)
                 return null;
             const result = JSON.parse(content);
@@ -345,135 +322,121 @@ HTML: ${htmlContent}`;
             return null;
         }
     }
-    storeResult(data) {
-        return __awaiter(this, void 0, void 0, function* () {
-            var _a;
-            if (!CONFIG.wpApiUrl || !CONFIG.wpUser || !CONFIG.wpPass)
-                return;
-            try {
-                const response = yield axios_1.default.post(CONFIG.wpApiUrl, data, {
-                    auth: { username: CONFIG.wpUser, password: CONFIG.wpPass },
-                    timeout: 30000
-                });
-                if ((_a = response.data) === null || _a === void 0 ? void 0 : _a.id) {
-                    console.log(`Stored primary item ID ${response.data.id}`);
-                }
+    async storeResult(data) {
+        if (!CONFIG.wpApiUrl || !CONFIG.wpUser || !CONFIG.wpPass)
+            return;
+        try {
+            const response = await axios.post(CONFIG.wpApiUrl, data, {
+                auth: { username: CONFIG.wpUser, password: CONFIG.wpPass },
+                timeout: 30000
+            });
+            if (response.data?.id) {
+                console.log(`Stored primary item ID ${response.data.id}`);
             }
-            catch (error) {
-                console.error('Primary WordPress storage failed:', error);
-            }
-        });
+        }
+        catch (error) {
+            console.error('Primary WordPress storage failed:', error);
+        }
     }
-    storeExtraResult(data) {
-        return __awaiter(this, void 0, void 0, function* () {
-            var _a;
-            if (!CONFIG.wpExtraApiUrl || !CONFIG.wpUser || !CONFIG.wpPass)
-                return;
-            try {
-                const payload = {
-                    "Headline": data.headline || 'No Headline',
-                    "Body": data.description || 'No Body',
-                    "source": data.source,
-                    "url": data.url
-                };
-                const response = yield axios_1.default.post(CONFIG.wpExtraApiUrl, payload, {
-                    auth: { username: CONFIG.wpUser, password: CONFIG.wpPass },
-                    timeout: 30000
-                });
-                if ((_a = response.data) === null || _a === void 0 ? void 0 : _a.id) {
-                    console.log(`Stored extra item ID ${response.data.id}`);
-                }
+    async storeExtraResult(data) {
+        if (!CONFIG.wpExtraApiUrl || !CONFIG.wpUser || !CONFIG.wpPass)
+            return;
+        try {
+            const payload = {
+                "Headline": data.headline || 'No Headline',
+                "Body": data.description || 'No Body',
+                "source": data.source,
+                "url": data.url
+            };
+            const response = await axios.post(CONFIG.wpExtraApiUrl, payload, {
+                auth: { username: CONFIG.wpUser, password: CONFIG.wpPass },
+                timeout: 30000
+            });
+            if (response.data?.id) {
+                console.log(`Stored extra item ID ${response.data.id}`);
             }
-            catch (error) {
-                console.error('Extra WordPress storage failed:', error);
-            }
-        });
+        }
+        catch (error) {
+            console.error('Extra WordPress storage failed:', error);
+        }
     }
 }
 // ========== Browser Management ==========
 let browser = null;
 let page = null;
-function setupBrowser() {
-    return __awaiter(this, void 0, void 0, function* () {
-        if (browser)
-            return;
-        browser = yield puppeteer_1.default.launch({
-            headless: "new",
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage'
-            ],
-            timeout: 60000
+async function setupBrowser() {
+    if (browser)
+        return;
+    browser = await puppeteer.launch({
+        headless: "new",
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage'
+        ],
+        timeout: 60000
+    });
+    page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    page.setDefaultNavigationTimeout(60000);
+}
+async function closeBrowser() {
+    if (browser) {
+        await browser.close();
+        browser = null;
+        page = null;
+    }
+}
+async function scrapeNews() {
+    try {
+        await setupBrowser();
+        if (!page)
+            throw new Error('Page not initialized');
+        await page.goto(CONFIG.websiteUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await page.waitForSelector('.box.item', { timeout: 30000 });
+        return await page.evaluate(() => {
+            return Array.from(document.querySelectorAll('.box.item'))
+                .map(item => ({
+                htmlContent: item.outerHTML
+            }))
+                .filter(item => item.htmlContent);
         });
-        page = yield browser.newPage();
-        yield page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        page.setDefaultNavigationTimeout(60000);
-    });
-}
-function closeBrowser() {
-    return __awaiter(this, void 0, void 0, function* () {
-        if (browser) {
-            yield browser.close();
-            browser = null;
-            page = null;
-        }
-    });
-}
-function scrapeNews() {
-    return __awaiter(this, void 0, void 0, function* () {
-        try {
-            yield setupBrowser();
-            if (!page)
-                throw new Error('Page not initialized');
-            yield page.goto(CONFIG.websiteUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-            yield page.waitForSelector('.box.item', { timeout: 30000 });
-            return yield page.evaluate(() => {
-                return Array.from(document.querySelectorAll('.box.item'))
-                    .map(item => ({
-                    htmlContent: item.outerHTML
-                }))
-                    .filter(item => item.htmlContent);
-            });
-        }
-        catch (err) {
-            yield closeBrowser();
-            return [];
-        }
-    });
+    }
+    catch (err) {
+        await closeBrowser();
+        return [];
+    }
 }
 // ========== Main Function ==========
-function main() {
-    return __awaiter(this, void 0, void 0, function* () {
-        const processor = new NewsProcessor();
-        try {
-            yield processor.initialize();
-            yield setupBrowser();
-            const items = yield scrapeNews();
-            yield new Promise(resolve => {
-                processor.setOnQueueComplete(resolve);
-                processor.addToQueue(items);
-            });
-        }
-        catch (err) {
-            console.error('Fatal error:', err);
-            process.exit(1);
-        }
-        finally {
-            yield closeBrowser();
-            process.exit(0);
-        }
-    });
+async function main() {
+    const processor = new NewsProcessor();
+    try {
+        await processor.initialize();
+        await setupBrowser();
+        const items = await scrapeNews();
+        await new Promise(resolve => {
+            processor.setOnQueueComplete(resolve);
+            processor.addToQueue(items);
+        });
+    }
+    catch (err) {
+        console.error('Fatal error:', err);
+        process.exit(1);
+    }
+    finally {
+        await closeBrowser();
+        process.exit(0);
+    }
 }
 // ========== Process Handlers ==========
-process.on('SIGINT', () => __awaiter(void 0, void 0, void 0, function* () {
-    yield closeBrowser();
+process.on('SIGINT', async () => {
+    await closeBrowser();
     process.exit(0);
-}));
-process.on('SIGTERM', () => __awaiter(void 0, void 0, void 0, function* () {
-    yield closeBrowser();
+});
+process.on('SIGTERM', async () => {
+    await closeBrowser();
     process.exit(0);
-}));
+});
 main().catch(err => {
     console.error('Uncaught error:', err);
     process.exit(1);
